@@ -235,7 +235,9 @@ preflight() {
     mem_mb=$(mem_total_mb); swap_mb=$(swap_total_mb)
     if [ "$free_gb" -ge 6 ]; then ok "disk: ${free_gb} GB free"; else warn "only ${free_gb} GB free on / — Hermes needs ~4-5 GB"; fi
     if [ "$mem_mb" -ge 1800 ]; then ok "RAM: ${mem_mb} MB, swap: ${swap_mb} MB"
-    else warn "only ${mem_mb} MB RAM (swap: ${swap_mb} MB) — 2 GB+ recommended; without swap the install may run out of memory"; fi
+    elif [ $(( mem_mb + swap_mb )) -ge "$SWAP_MIN_MB" ]; then
+        warn "only ${mem_mb} MB RAM — enough to install with ${swap_mb} MB swap, but the agent may be slow"
+    else warn "only ${mem_mb} MB RAM (swap: ${swap_mb} MB) — 2 GB+ recommended; the next step can add swap"; fi
 
     if [ "$NON_INTERACTIVE" = false ] && [ "$HAVE_TTY" = false ]; then
         die "no terminal for questions. Run from an interactive shell or pass --non-interactive"
