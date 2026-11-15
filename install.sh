@@ -25,6 +25,7 @@ DO_SSH_HARDENING=""    # key-only SSH login
 DO_DASHBOARD=""        # loopback-only web dashboard
 DO_TELEGRAM=""
 DO_SWAP=""             # swap file when RAM + swap is low
+DO_UPGRADE=""          # apt full-upgrade of the base system
 SKIP_BROWSER=false
 SKIP_MODEL_SETUP=false
 MODE="install"         # install | update
@@ -53,6 +54,7 @@ Options:
   --[no-]firewall         ufw: deny incoming except SSH (default: ask, yes)
   --[no-]ssh-hardening    Key-only SSH, no root password login (default: ask)
   --[no-]dashboard        Web dashboard on 127.0.0.1:9119 (default: ask, no)
+  --[no-]upgrade          Upgrade all installed packages first (default: ask, yes)
   --[no-]swap             Create a swap file if RAM + swap < 3.5 GB (default: ask, yes)
   --no-telegram           Do not configure Telegram
   --skip-browser          Do not install Chromium for the browser tool
@@ -79,6 +81,8 @@ while [ $# -gt 0 ]; do
         --no-dashboard) DO_DASHBOARD=no; shift ;;
         --swap) DO_SWAP=yes; shift ;;
         --no-swap) DO_SWAP=no; shift ;;
+        --upgrade) DO_UPGRADE=yes; shift ;;
+        --no-upgrade) DO_UPGRADE=no; shift ;;
         --no-telegram) DO_TELEGRAM=no; shift ;;
         --skip-browser) SKIP_BROWSER=true; shift ;;
         --skip-model-setup) SKIP_MODEL_SETUP=true; shift ;;
@@ -240,6 +244,8 @@ preflight() {
 # ----------------------------------------------------------- the plan -------
 gather_choices() {
     step "Configuration"
+    # VPS images are often months old: kernel, openssl, sudo with known holes
+    decide DO_UPGRADE "Upgrade all installed system packages now (recommended on a fresh VPS)?" yes
     decide DO_BASE_HARDENING "Enable unattended security updates and fail2ban (SSH brute-force protection)?" yes
     decide DO_FIREWALL "Enable the ufw firewall (deny all incoming except SSH)?" yes
 
@@ -359,6 +365,15 @@ install_packages() {
     step "System packages"
     info "apt may wait a few minutes if the system is still installing updates after boot…"
     apt_get update
+    if [ "$DO_UPGRADE" = yes ]; then
+        info "upgrading installed packages (can take a few minutes)…"
+        # keep local config files on conffile conflicts instead of prompting
+        if apt_get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold full-upgrade; then
+            ok "system packages upgraded"
+        else
+            warn "package upgrade failed — run 'apt-get full-upgrade' manually later"
+        fi
+    fi
     apt_install ca-certificates curl git sudo xz-utils tar libatomic1 procps util-linux iproute2
     ok "base packages"
 
@@ -815,6 +830,10 @@ EOF
         echo "  Dashboard         ssh -L 9119:127.0.0.1:9119 root@${ip:-<server>}   then open http://127.0.0.1:9119"
     fi
     echo
+    if [ -f /var/run/reboot-required ]; then
+        warn "a reboot is needed to finish updates (new kernel or core libraries): run 'reboot' when convenient — Hermes starts again on its own"
+        echo
+    fi
 }
 
 # ------------------------------------------------------------------ update --

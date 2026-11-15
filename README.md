@@ -25,6 +25,9 @@ sudo bash install.sh
 
 The script asks a few questions and walks you through:
 
+1. **System upgrade**: `apt-get full-upgrade` of everything already installed
+   (VPS images are often months old), keeping local config files; at the end it
+   tells you if a reboot is needed for a new kernel.
 1. **Swap**: if RAM + swap is under 3.5 GB (a 1–2 GB VPS), offers to create a
    swap file (`/swapfile-hermes`, up to 4 GB, `vm.swappiness=10`) so the install
    and the agent don't get OOM-killed. Skipped in containers and when disk is short.
