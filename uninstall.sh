@@ -48,6 +48,10 @@ echo "    To revert SSH hardening: rm /etc/ssh/sshd_config.d/00-hermes-secure-de
 
 if [ "$PURGE" = true ] && id "$HERMES_USER" >/dev/null 2>&1; then
     home=$(getent passwd "$HERMES_USER" | cut -d: -f6)
+    if [ "$home" != "/home/$HERMES_USER" ]; then
+        echo "    home of $HERMES_USER is '$home', not /home/$HERMES_USER — refusing to delete it automatically" >&2
+        exit 1
+    fi
     if confirm "Delete user '$HERMES_USER' and $home (agent config, secrets, memories)?"; then
         backup="/root/hermes-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
         tar -czf "$backup" -C "$(dirname "$home")" --exclude='.hermes/tools' --exclude='.hermes/cache' "$(basename "$home")"

@@ -37,9 +37,9 @@ The script asks a few questions and walks you through:
    user-ID **allow-list**, so strangers can't drive your agent. The token is read
    hidden and never passed on a command line.
 5. **Model provider**: runs the official `hermes setup model` wizard as `hermes`.
-6. **systemd**: lets Hermes generate its own system unit
-   (`hermes gateway install --system --run-as-user hermes`) and adds a sandbox
-   drop-in that survives Hermes updates. The web dashboard is optional and bound to
+6. **systemd**: writes the gateway unit from a static template plus a sandbox
+   drop-in. Root never runs Hermes' own `gateway install`, because root must not
+   execute code the agent can modify. The web dashboard is optional and bound to
    `127.0.0.1` only.
 7. **Verification**: checks the gateway runs as `hermes`, has `NoNewPrivileges`,
    connected to Telegram, and that the account can't sudo, read `/etc/shadow`,

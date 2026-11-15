@@ -155,30 +155,47 @@ as_hermes() {
         "$@")
 }
 
-apt_install() {
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "$@" >/dev/null
+apt_get() {
+    # Fresh VPSes run unattended-upgrades right after boot: wait for the dpkg lock
+    # instead of failing; NEEDRESTART_MODE=a stops needrestart's hidden dialog.
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+        apt-get -o DPkg::Lock::Timeout=600 -y -q "$@" >/dev/null
 }
+apt_install() { apt_get install --no-install-recommends "$@"; }
 
-# set_env KEY VALUE — upsert into the agent's .env without exposing VALUE in argv
+# Everything that touches files inside the agent's home runs AS the agent user:
+# root never reads, writes or executes agent-controlled paths (symlink/code swaps).
+
+# set_env KEY VALUE — upsert into the agent's .env; VALUE travels via stdin, not argv
 set_env() {
-    local key="$1" value="$2" tmp line
+    local key="$1" value="$2" line
     [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid env key: $key"
     [[ "$value" != *$'\n'* ]] || die "env value for $key contains a newline"
     if [[ "$value" =~ ^[A-Za-z0-9_./:@,+=-]*$ ]]; then line="$key=$value"
     elif [[ "$value" != *"'"* ]]; then line="$key='$value'"
     else die "env value for $key contains a single quote; set it manually in $ENV_FILE"; fi
-    touch "$ENV_FILE"
-    tmp="$(mktemp "$ENV_FILE.XXXXXX")"
-    grep -Ev "^[[:space:]]*(export[[:space:]]+)?${key}=" "$ENV_FILE" >"$tmp" || true
-    printf '%s\n' "$line" >>"$tmp"
-    mv "$tmp" "$ENV_FILE"
-    chown "$HERMES_USER:$HERMES_USER" "$ENV_FILE"
-    chmod 600 "$ENV_FILE"
+    # shellcheck disable=SC2016  # expanded by the inner shell
+    printf '%s\n' "$line" | as_hermes bash -c '
+        set -e; umask 077; f=$1; k=$2
+        mkdir -p "$(dirname "$f")"; touch "$f"
+        t=$(mktemp "$f.XXXXXX")
+        grep -Ev "^[[:space:]]*(export[[:space:]]+)?$k=" "$f" >"$t" || true
+        cat >>"$t"; mv -f "$t" "$f"; chmod 600 "$f"' _ "$ENV_FILE" "$key" \
+        || die "could not write $key to $ENV_FILE"
 }
 
-get_env() { { grep -E "^[[:space:]]*(export[[:space:]]+)?$1=" "$ENV_FILE" 2>/dev/null || true; } | tail -1 | cut -d= -f2- | sed -E "s/^['\"]//; s/['\"]$//"; }
+get_env() {
+    { as_hermes cat "$ENV_FILE" 2>/dev/null || true; } \
+        | { grep -E "^[[:space:]]*(export[[:space:]]+)?$1=" || true; } \
+        | tail -1 | cut -d= -f2- | sed -E "s/^['\"]//; s/['\"]$//"
+}
 
-fix_ownership() { chown -R "$HERMES_USER:$HERMES_USER" "$HOME_DIR"; chmod 700 "$HOME_DIR"; [ ! -d "$HERMES_DIR" ] || chmod 700 "$HERMES_DIR"; }
+# chown -R does not follow symlinks inside the tree; chmod only on real directories.
+fix_ownership() {
+    chown -R "$HERMES_USER:$HERMES_USER" "$HOME_DIR"
+    chmod 700 "$HOME_DIR"
+    if [ -d "$HERMES_DIR" ] && [ ! -L "$HERMES_DIR" ]; then chmod 700 "$HERMES_DIR"; fi
+}
 
 # ------------------------------------------------------------- preflight ----
 preflight() {
@@ -215,19 +232,25 @@ gather_choices() {
     decide DO_BASE_HARDENING "Enable unattended security updates and fail2ban (SSH brute-force protection)?" yes
     decide DO_FIREWALL "Enable the ufw firewall (deny all incoming except SSH)?" yes
 
-    local keys=false f
-    for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
-        if [ -s "$f" ] && grep -qE '^(ssh-|ecdsa-|sk-)' "$f"; then keys=true; fi
-    done
+    # Only the account you are logged in as counts: a key in someone else's home
+    # does not keep *you* from being locked out of root.
+    local keys=false admin admin_home
+    admin="${SUDO_USER:-root}"
+    admin_home="$(getent passwd "$admin" | cut -d: -f6)"
+    if [ -s "$admin_home/.ssh/authorized_keys" ] \
+       && grep -qE '(^|[[:space:]])(ssh-(ed25519|rsa|dss)|ecdsa-sha2-[a-z0-9]+|sk-[a-z0-9@.-]+) AAAA' "$admin_home/.ssh/authorized_keys"; then
+        keys=true
+    fi
     if [ -z "$DO_SSH_HARDENING" ]; then
         if [ "$keys" = true ]; then
-            decide DO_SSH_HARDENING "Disable SSH password login (key-only; an authorized_keys file was found)?" yes
+            info "SSH key found for '$admin'. Only say yes if you logged in with that key right now."
+            decide DO_SSH_HARDENING "Disable SSH password login (key-only)?" yes
         else
-            warn "no SSH authorized_keys found — skipping SSH hardening so you don't get locked out"
+            warn "no SSH key in $admin_home/.ssh/authorized_keys — skipping SSH hardening so you don't get locked out"
             DO_SSH_HARDENING=no
         fi
     elif [ "$DO_SSH_HARDENING" = yes ] && [ "$keys" = false ]; then
-        die "--ssh-hardening requested but no authorized_keys with a key exists — you would be locked out"
+        die "--ssh-hardening requested but '$admin' has no SSH key in authorized_keys — you would be locked out"
     fi
 
     decide DO_DASHBOARD "Run the web dashboard (bound to 127.0.0.1 only, reach it through an SSH tunnel)?" no
@@ -246,7 +269,8 @@ gather_choices() {
 # ------------------------------------------------------------ packages ------
 install_packages() {
     step "System packages"
-    DEBIAN_FRONTEND=noninteractive apt-get update -q >/dev/null
+    info "apt may wait a few minutes if the system is still installing updates after boot…"
+    apt_get update
     apt_install ca-certificates curl git sudo xz-utils tar libatomic1 procps util-linux iproute2
     ok "base packages"
 
@@ -288,9 +312,9 @@ maxretry = 5
 findtime = 10m
 bantime  = 1h
 EOF
-    systemctl enable fail2ban >/dev/null 2>&1
-    systemctl restart fail2ban
-    ok "fail2ban (sshd jail)"
+    systemctl enable fail2ban >/dev/null 2>&1 || true
+    if systemctl restart fail2ban; then ok "fail2ban (sshd jail)"
+    else warn "fail2ban did not start — check: journalctl -u fail2ban"; fi
 }
 
 firewall() {
@@ -324,7 +348,6 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 PermitEmptyPasswords no
-MaxAuthTries 4
 X11Forwarding no
 EOF
     if ! sshd -t 2>/dev/null; then
@@ -332,7 +355,10 @@ EOF
         warn "sshd rejected the config — rolled back"
         return 0
     fi
-    systemctl reload ssh 2>/dev/null || systemctl reload sshd
+    if ! { systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; }; then
+        warn "could not reload sshd — the new settings apply after: systemctl restart ssh"
+        return 0
+    fi
     ok "password login disabled, root login with keys only"
     warn "keep this session open and test a new SSH login in another terminal"
 }
@@ -367,8 +393,8 @@ create_user() {
     fi
     ok "no sudo, no privileged groups, password locked"
 
-    mkdir -p "$HOME_DIR/.local/bin"
     fix_ownership
+    as_hermes mkdir -p "$HOME_DIR/.local/bin"
     # Hermes' restart-safe cron/kanban workers run under the user's systemd manager.
     loginctl enable-linger "$HERMES_USER" >/dev/null 2>&1 || warn "could not enable linger for $HERMES_USER"
 }
@@ -519,10 +545,11 @@ UMask=0077
 EOF
 }
 
-write_fallback_gateway_unit() {
+write_gateway_unit() {
     local node_bin uid
     uid=$(id -u "$HERMES_USER")
-    node_bin=$(find "$HERMES_DIR/tools" -maxdepth 2 -type d -path '*/node-*/bin' 2>/dev/null | sort | tail -1)
+    # Hermes-managed Node.js; versioned dir, so this is refreshed on every --update.
+    node_bin=$(as_hermes find "$HERMES_DIR/tools" -maxdepth 2 -type d -path '*/node-*/bin' 2>/dev/null | sort -V | tail -1 || true)
     cat >"/etc/systemd/system/$GATEWAY_UNIT" <<EOF
 $MARKER
 [Unit]
@@ -561,17 +588,11 @@ EOF
 
 install_units() {
     step "systemd services"
-    # Prefer the unit Hermes generates itself (kept current by upstream); fall back to ours.
-    if (cd / && env HOME=/root HERMES_HOME="$HERMES_DIR" "$HERMES_BIN" gateway install --system \
-            --run-as-user "$HERMES_USER" --force) >>"$LOG_FILE" 2>&1 \
-       && [ -f "/etc/systemd/system/$GATEWAY_UNIT" ] \
-       && grep -q "^User=$HERMES_USER\$" "/etc/systemd/system/$GATEWAY_UNIT"; then
-        ok "gateway unit generated by Hermes"
-    else
-        write_fallback_gateway_unit
-        warn "used the bundled gateway unit (Hermes' own generator failed — see $LOG_FILE)"
-    fi
-    fix_ownership   # running the CLI as root above may have created root-owned files
+    # The unit is written from a static template on purpose. `hermes gateway install
+    # --system` would have to run as root, and root must never execute code that
+    # lives in (and can be modified from) the agent's own home directory.
+    write_gateway_unit
+    ok "gateway unit: /etc/systemd/system/$GATEWAY_UNIT"
     write_hardening_dropin "$GATEWAY_UNIT"
     ok "sandbox drop-in: /etc/systemd/system/$GATEWAY_UNIT.d/10-hardening.conf"
 
@@ -580,7 +601,7 @@ install_units() {
 $MARKER
 [Unit]
 Description=Hermes Agent dashboard (127.0.0.1 only; user $HERMES_USER)
-After=network-online.target
+After=network-online.target $GATEWAY_UNIT
 Wants=network-online.target
 
 [Service]
@@ -607,13 +628,14 @@ EOF
 
     systemctl daemon-reload
     systemctl enable "$GATEWAY_UNIT" >/dev/null 2>&1
+    GATEWAY_STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
     systemctl restart "$GATEWAY_UNIT"
-    if [ "$DO_DASHBOARD" = yes ]; then
-        systemctl enable "$DASHBOARD_UNIT" >/dev/null 2>&1
-        systemctl restart "$DASHBOARD_UNIT"
-    fi
-    ok "services enabled and started"
+    # The dashboard is started by verify() once the gateway is up: on first start
+    # both would race to finish Hermes' dependency install and one of them fails.
+    [ "$DO_DASHBOARD" != yes ] || systemctl enable "$DASHBOARD_UNIT" >/dev/null 2>&1
+    ok "gateway enabled and started"
 }
+GATEWAY_STARTED_AT=""
 
 install_wrapper() {
     step "CLI wrapper"
@@ -647,7 +669,7 @@ verify() {
     done
     if [ "$running" = true ]; then
         ok "gateway is running (pid $pid)"
-        if [ "$(ps -o user= -p "$pid" | tr -d ' ')" = "$HERMES_USER" ]; then ok "runs as $HERMES_USER"
+        if [ "$(ps -o uid= -p "$pid" | tr -d ' ')" = "$(id -u "$HERMES_USER")" ]; then ok "runs as $HERMES_USER"
         else warn "gateway does NOT run as $HERMES_USER"; fi
         if grep -q '^NoNewPrivs:[[:space:]]*1' "/proc/$pid/status"; then ok "NoNewPrivileges active"
         else warn "NoNewPrivileges not active"; fi
@@ -659,7 +681,7 @@ verify() {
         info "waiting for Telegram (first start installs dependencies, up to ~3 min)…"
         local connected=false
         for _ in $(seq 1 90); do
-            if journalctl -u "$GATEWAY_UNIT" --since "-10min" --no-pager 2>/dev/null | grep -q 'Connected to Telegram'; then
+            if journalctl -u "$GATEWAY_UNIT" --since "${GATEWAY_STARTED_AT:--10min}" --no-pager 2>/dev/null | grep -q 'Connected to Telegram'; then
                 connected=true; break
             fi
             sleep 2
@@ -677,7 +699,8 @@ verify() {
         else ok "no Docker access"; fi
     fi
     if [ "$DO_DASHBOARD" = yes ]; then
-        for _ in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q '127.0.0.1:9119 ' && break; sleep 2; done
+        systemctl restart "$DASHBOARD_UNIT"
+        for _ in $(seq 1 60); do ss -ltn 2>/dev/null | grep -q '127.0.0.1:9119 ' && break; sleep 2; done
         if ss -ltn | grep -q '127.0.0.1:9119 '; then ok "dashboard listening on 127.0.0.1:9119"
         else warn "dashboard not listening yet: journalctl -u $DASHBOARD_UNIT"; fi
     fi
