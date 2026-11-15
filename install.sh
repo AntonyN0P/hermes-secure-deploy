@@ -24,6 +24,7 @@ DO_FIREWALL=""         # ufw, SSH only
 DO_SSH_HARDENING=""    # key-only SSH login
 DO_DASHBOARD=""        # loopback-only web dashboard
 DO_TELEGRAM=""
+DO_SWAP=""             # swap file when RAM + swap is low
 SKIP_BROWSER=false
 SKIP_MODEL_SETUP=false
 MODE="install"         # install | update
@@ -52,6 +53,7 @@ Options:
   --[no-]firewall         ufw: deny incoming except SSH (default: ask, yes)
   --[no-]ssh-hardening    Key-only SSH, no root password login (default: ask)
   --[no-]dashboard        Web dashboard on 127.0.0.1:9119 (default: ask, no)
+  --[no-]swap             Create a swap file if RAM + swap < 3.5 GB (default: ask, yes)
   --no-telegram           Do not configure Telegram
   --skip-browser          Do not install Chromium for the browser tool
   --skip-model-setup      Do not run 'hermes setup model'
@@ -75,6 +77,8 @@ while [ $# -gt 0 ]; do
         --no-ssh-hardening) DO_SSH_HARDENING=no; shift ;;
         --dashboard) DO_DASHBOARD=yes; shift ;;
         --no-dashboard) DO_DASHBOARD=no; shift ;;
+        --swap) DO_SWAP=yes; shift ;;
+        --no-swap) DO_SWAP=no; shift ;;
         --no-telegram) DO_TELEGRAM=no; shift ;;
         --skip-browser) SKIP_BROWSER=true; shift ;;
         --skip-model-setup) SKIP_MODEL_SETUP=true; shift ;;
@@ -93,6 +97,9 @@ HERMES_BIN="$HOME_DIR/.local/bin/hermes"
 ENV_FILE="$HERMES_DIR/.env"
 GATEWAY_UNIT="hermes-gateway.service"
 DASHBOARD_UNIT="hermes-dashboard.service"
+SWAP_FILE="/swapfile-hermes"
+SWAP_TARGET_MB=4096    # size swap so that RAM + swap reaches this…
+SWAP_MIN_MB=3584       # …but only bother when RAM + swap is below this
 
 # ---------------------------------------------------------------- output ----
 if [ -t 1 ]; then
@@ -197,6 +204,9 @@ fix_ownership() {
     if [ -d "$HERMES_DIR" ] && [ ! -L "$HERMES_DIR" ]; then chmod 700 "$HERMES_DIR"; fi
 }
 
+mem_total_mb()  { awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo; }
+swap_total_mb() { awk '/^SwapTotal:/{print int($2/1024)}' /proc/meminfo; }
+
 # ------------------------------------------------------------- preflight ----
 preflight() {
     step "Preflight checks"
@@ -215,11 +225,12 @@ preflight() {
     [ -d /run/systemd/system ] || die "systemd is not running (containers without systemd are not supported)"
     case "$(uname -m)" in x86_64|aarch64) ok "arch: $(uname -m)" ;; *) die "unsupported CPU architecture $(uname -m)" ;; esac
 
-    local free_gb mem_mb
+    local free_gb mem_mb swap_mb
     free_gb=$(df -Pk / | awk 'NR==2{print int($4/1024/1024)}')
-    mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+    mem_mb=$(mem_total_mb); swap_mb=$(swap_total_mb)
     if [ "$free_gb" -ge 6 ]; then ok "disk: ${free_gb} GB free"; else warn "only ${free_gb} GB free on / — Hermes needs ~4-5 GB"; fi
-    if [ "$mem_mb" -ge 1800 ]; then ok "RAM: ${mem_mb} MB"; else warn "only ${mem_mb} MB RAM — 2 GB+ recommended"; fi
+    if [ "$mem_mb" -ge 1800 ]; then ok "RAM: ${mem_mb} MB, swap: ${swap_mb} MB"
+    else warn "only ${mem_mb} MB RAM (swap: ${swap_mb} MB) — 2 GB+ recommended; without swap the install may run out of memory"; fi
 
     if [ "$NON_INTERACTIVE" = false ] && [ "$HAVE_TTY" = false ]; then
         die "no terminal for questions. Run from an interactive shell or pass --non-interactive"
@@ -253,6 +264,16 @@ gather_choices() {
         die "--ssh-hardening requested but '$admin' has no SSH key in authorized_keys — you would be locked out"
     fi
 
+    if [ -z "$DO_SWAP" ]; then
+        local have=$(( $(mem_total_mb) + $(swap_total_mb) ))
+        if [ "$have" -lt "$SWAP_MIN_MB" ]; then
+            info "RAM + swap is ${have} MB; installing Hermes and Chromium can need more than that."
+            decide DO_SWAP "Create a swap file so the install and the agent don't get OOM-killed?" yes
+        else
+            DO_SWAP=no
+        fi
+    fi
+
     decide DO_DASHBOARD "Run the web dashboard (bound to 127.0.0.1 only, reach it through an SSH tunnel)?" no
     if [ -z "$DO_TELEGRAM" ]; then
         if [ "$NON_INTERACTIVE" = true ]; then
@@ -264,6 +285,73 @@ gather_choices() {
     if [ "$SKIP_BROWSER" = false ] && ! ask_yn "Install Chromium for the agent's browser tool (~600 MB)?" yes; then
         SKIP_BROWSER=true
     fi
+}
+
+# ----------------------------------------------------------------- swap -----
+ensure_swap() {
+    [ "$DO_SWAP" = yes ] || return 0
+    step "Swap"
+    local mem_mb swap_mb need_mb free_mb fstype
+    mem_mb=$(mem_total_mb); swap_mb=$(swap_total_mb)
+    need_mb=$(( SWAP_TARGET_MB - mem_mb - swap_mb ))
+    if [ $(( mem_mb + swap_mb )) -ge "$SWAP_MIN_MB" ]; then ok "RAM ${mem_mb} MB + swap ${swap_mb} MB is enough"; return 0; fi
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$SWAP_FILE"; then
+        ok "$SWAP_FILE is already active"; return 0
+    fi
+    # round up to whole GB, at least 1 GB, at most 4 GB
+    need_mb=$(( (need_mb + 1023) / 1024 * 1024 ))
+    [ "$need_mb" -ge 1024 ] || need_mb=1024
+    [ "$need_mb" -le 4096 ] || need_mb=4096
+
+    if systemd-detect-virt --container --quiet 2>/dev/null; then
+        warn "running in a container ($(systemd-detect-virt --container)) — swap is controlled by the host, skipping"
+        return 0
+    fi
+    fstype=$(findmnt -no FSTYPE / 2>/dev/null || echo unknown)
+    case "$fstype" in
+        ext2|ext3|ext4|xfs|btrfs) ;;
+        *) warn "swap files are not supported on '$fstype' — skipping (add swap manually if the install gets killed)"; return 0 ;;
+    esac
+    free_mb=$(df -Pm / | awk 'NR==2{print $4}')
+    if [ $(( free_mb - need_mb )) -lt 6144 ]; then
+        warn "not enough disk for a ${need_mb} MB swap file plus ~6 GB for Hermes (${free_mb} MB free) — skipping"
+        return 0
+    fi
+    if [ -e "$SWAP_FILE" ]; then
+        warn "$SWAP_FILE exists but is not active — leaving it alone, skipping"
+        return 0
+    fi
+
+    info "creating a ${need_mb} MB swap file at $SWAP_FILE…"
+    local made=false how
+    if [ "$fstype" = btrfs ]; then
+        # btrfs needs a NOCOW, uncompressed file; this helper does it right (btrfs-progs 6.1+)
+        btrfs filesystem mkswapfile --size "${need_mb}m" "$SWAP_FILE" >/dev/null 2>&1 \
+            && swapon "$SWAP_FILE" 2>/dev/null && made=true
+    else
+        # fast fallocate first; some kernels/filesystems reject such files, so fall back to dd
+        for how in fallocate dd; do
+            rm -f "$SWAP_FILE"
+            if [ "$how" = fallocate ]; then
+                (umask 077; fallocate -l "${need_mb}M" "$SWAP_FILE") 2>/dev/null || continue
+            else
+                (umask 077; dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$need_mb" status=none) 2>/dev/null || continue
+            fi
+            chmod 600 "$SWAP_FILE"
+            if mkswap "$SWAP_FILE" >/dev/null 2>&1 && swapon "$SWAP_FILE" 2>/dev/null; then made=true; break; fi
+        done
+    fi
+    if [ "$made" = false ]; then
+        rm -f "$SWAP_FILE"
+        warn "could not enable a swap file (the VPS may not allow swap) — continuing without it"
+        return 0
+    fi
+    grep -qE "^[[:space:]]*${SWAP_FILE}[[:space:]]" /etc/fstab \
+        || printf '%s none swap sw 0 0\n' "$SWAP_FILE" >>/etc/fstab
+    # swap as overflow only, not instead of RAM
+    printf '%s\nvm.swappiness = 10\n' "$MARKER" >/etc/sysctl.d/90-hermes-swap.conf
+    sysctl -q -w vm.swappiness=10 >/dev/null 2>&1 || true
+    ok "swap: ${need_mb} MB at $SWAP_FILE (persisted in /etc/fstab, vm.swappiness=10)"
 }
 
 # ------------------------------------------------------------ packages ------
@@ -747,6 +835,7 @@ main() {
     preflight
     if [ "$MODE" = update ]; then do_update; summary; return; fi
     gather_choices
+    ensure_swap
     install_packages
     base_hardening
     firewall

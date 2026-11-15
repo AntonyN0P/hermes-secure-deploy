@@ -25,6 +25,9 @@ sudo bash install.sh
 
 The script asks a few questions and walks you through:
 
+1. **Swap**: if RAM + swap is under 3.5 GB (a 1–2 GB VPS), offers to create a
+   swap file (`/swapfile-hermes`, up to 4 GB, `vm.swappiness=10`) so the install
+   and the agent don't get OOM-killed. Skipped in containers and when disk is short.
 1. **OS hardening** (optional): unattended security updates, fail2ban for SSH, ufw
    (deny all incoming except SSH), and key-only SSH (offered only if an
    `authorized_keys` already exists, so you can't lock yourself out).

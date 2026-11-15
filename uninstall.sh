@@ -45,6 +45,10 @@ fi
 
 echo "    OS hardening (ufw, fail2ban, unattended-upgrades, SSH config) is left in place."
 echo "    To revert SSH hardening: rm /etc/ssh/sshd_config.d/00-hermes-secure-deploy.conf && systemctl reload ssh"
+if [ -f /swapfile-hermes ]; then
+    echo "    Swap file /swapfile-hermes is left in place. To remove it:"
+    echo "      swapoff /swapfile-hermes && rm /swapfile-hermes && sed -i '\\|^/swapfile-hermes |d' /etc/fstab && rm -f /etc/sysctl.d/90-hermes-swap.conf"
+fi
 
 if [ "$PURGE" = true ] && id "$HERMES_USER" >/dev/null 2>&1; then
     home=$(getent passwd "$HERMES_USER" | cut -d: -f6)
