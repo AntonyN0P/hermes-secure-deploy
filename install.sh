@@ -10,6 +10,7 @@ set -Eeuo pipefail
 
 VERSION="0.1.0"
 HERMES_INSTALLER_URL="${HERMES_INSTALLER_URL:-https://hermes-agent.nousresearch.com/install.sh}"
+HERMES_INSTALLER_FALLBACK_URL="${HERMES_INSTALLER_FALLBACK_URL:-https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh}"
 LOG_FILE="/var/log/hermes-secure-deploy.log"
 MARKER="# managed-by: hermes-secure-deploy"
 LOCK_FILE="/run/hermes-secure-deploy.lock"
@@ -513,10 +514,29 @@ install_hermes() {
     fi
     local tmp args
     tmp="$(mktemp -d /tmp/hermes-secure-deploy.XXXXXX)"
-    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 "$HERMES_INSTALLER_URL" -o "$tmp/install.sh" \
-        || die "could not download the Hermes installer from $HERMES_INSTALLER_URL"
+    local url src="" err
+    # The site is on Vercel, which some networks block; GitHub serves the same file.
+    for url in "$HERMES_INSTALLER_URL" "$HERMES_INSTALLER_FALLBACK_URL"; do
+        if err=$(curl -fsSL --proto '=https' --tlsv1.2 --retry 2 --connect-timeout 15 --max-time 120 \
+                      "$url" -o "$tmp/install.sh" 2>&1); then
+            src="$url"; break
+        fi
+        err="${err##*$'\n'}"
+        warn "download failed: $url — ${err:-unknown error}"
+        # fresh VPSes sometimes advertise IPv6 without working routes
+        if err=$(curl -4 -fsSL --proto '=https' --tlsv1.2 --retry 2 --connect-timeout 15 --max-time 120 \
+                      "$url" -o "$tmp/install.sh" 2>&1); then
+            warn "works over IPv4 only — IPv6 on this server looks broken"
+            src="$url"; break
+        fi
+    done
+    if [ -z "$src" ]; then
+        rm -rf "$tmp"
+        die "could not download the Hermes installer. Check outbound HTTPS/DNS: curl -v $HERMES_INSTALLER_URL"
+    fi
+    head -1 "$tmp/install.sh" | grep -q '^#!' || { rm -rf "$tmp"; die "$src did not return a shell script (captive portal or block page?)"; }
     chmod 755 "$tmp"; chmod 644 "$tmp/install.sh"
-    info "official installer: $HERMES_INSTALLER_URL"
+    info "official installer: $src"
     info "sha256: $(sha256sum "$tmp/install.sh" | cut -d' ' -f1)"
     info "running it as '$HERMES_USER' (not root); this takes a few minutes…"
     args=(--non-interactive --channel "$CHANNEL")
